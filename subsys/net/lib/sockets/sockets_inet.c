@@ -663,9 +663,11 @@ ssize_t zsock_sendto_ctx(struct net_context *ctx, const void *buf, size_t len,
 	end = sys_timepoint_calc(timeout);
 
 	/* Register the callback before sending in order to receive the response
-	 * from the peer.
+	 * from the peer. Once registered, a context with a connection handler
+	 * needs no update.
 	 */
-	if (!sock_is_eof(ctx)) {
+	if (!sock_is_eof(ctx) &&
+	    (ctx->recv_cb != zsock_received_cb || ctx->conn_handler == NULL)) {
 		status = net_context_recv(ctx, zsock_received_cb,
 					  K_NO_WAIT, ctx->user_data);
 		if (status < 0) {
@@ -1458,6 +1460,7 @@ static size_t zsock_recv_stream_immediate(struct net_context *ctx, uint8_t **buf
 	const bool do_recv = !(buf == NULL || max_len == NULL);
 	size_t _max_len = (max_len == NULL) ? SIZE_MAX : *max_len;
 	const bool peek = (flags & ZSOCK_MSG_PEEK) == ZSOCK_MSG_PEEK;
+	const struct net_pkt *head = k_fifo_peek_head(&ctx->recv_q);
 
 	while (_max_len > 0) {
 		/* only peek until we know we can dequeue and / or requeue buffer */
@@ -1505,8 +1508,11 @@ static size_t zsock_recv_stream_immediate(struct net_context *ctx, uint8_t **buf
 
 				net_pkt_unref(pkt);
 			}
-		} else if (!do_recv || peek) {
-			/* requeue packets when observing */
+		} else if ((!do_recv || peek) && _max_len > 0) {
+			/* requeue packets when observing, do not requeue if it is the last packet
+			 * as it will be requeued below. This allows to skip requeuing when
+			 * observing only the first packet
+			 */
 			k_fifo_put(&ctx->recv_q, k_fifo_get(&ctx->recv_q, K_NO_WAIT));
 		}
 	}
@@ -1514,6 +1520,11 @@ static size_t zsock_recv_stream_immediate(struct net_context *ctx, uint8_t **buf
 	if (do_recv) {
 		/* convey remaining buffer size back to caller */
 		*max_len = _max_len;
+	}
+
+	/* when observing, the queue should return to the initial state */
+	while ((!do_recv || peek) && k_fifo_peek_head(&ctx->recv_q) != head) {
+		k_fifo_put(&ctx->recv_q, k_fifo_get(&ctx->recv_q, K_NO_WAIT));
 	}
 
 	return recv_len;
@@ -2546,6 +2557,13 @@ static int ipv4_multicast_group(struct net_context *ctx, const void *optval,
 		ret = net_ipv4_igmp_leave(iface, &mreqn->imr_multiaddr);
 	}
 
+	if (ret == -ENETDOWN) {
+		/* If the interface is down, we can still return success as the
+		 * join will be performed when the interface comes up.
+		 */
+		return 0;
+	}
+
 	if (ret < 0) {
 		errno  = -ret;
 		return -1;
@@ -2596,6 +2614,13 @@ static int ipv6_multicast_group(struct net_context *ctx, const void *optval,
 		ret = net_ipv6_mld_join(iface, &mreq->ipv6mr_multiaddr);
 	} else {
 		ret = net_ipv6_mld_leave(iface, &mreq->ipv6mr_multiaddr);
+	}
+
+	if (ret == -ENETDOWN) {
+		/* If the interface is down, we can still return success as the
+		 * join will be performed when the interface comes up.
+		 */
+		return 0;
 	}
 
 	if (ret < 0) {
